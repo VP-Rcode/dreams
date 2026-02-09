@@ -1,0 +1,95 @@
+import OpenAI from "openai";
+import { z } from "zod";
+
+export const runtime = "nodejs";
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const PromptPack = z.object({
+  style: z.string(),
+  prompts: z.array(z.string()).length(4)
+});
+
+export async function POST(req: Request) {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return Response.json({ error: "Missing OPENAI_API_KEY" }, { status: 500 });
+    }
+
+    const body = await req.json().catch(() => null);
+    const dream = typeof body?.dream === "string" ? body.dream.trim() : "";
+    const aesthetic = typeof body?.aesthetic === "string" ? body.aesthetic.trim() : "dreamy collage";
+
+    if (dream.length < 20) {
+      return Response.json(
+        { error: "Please write a bit more detail (at least ~20 characters)." },
+        { status: 400 }
+      );
+    }
+
+    // 1) Use text model to turn the dream into 4 scene prompts + a coherent style string
+    // Responses API creates a model response. :contentReference[oaicite:2]{index=2}
+    const promptResponse = await openai.responses.create({
+      model: "gpt-5.2",
+      input: [
+        {
+          role: "system",
+          content:
+            "You transform dream descriptions into 4 distinct cinematic scene prompts for image generation. " +
+            "Return ONLY JSON with: { style: string, prompts: [p1,p2,p3,p4] }. " +
+            "Each prompt should be vivid, concrete, and safe. Avoid text in the image. Keep each prompt under 60 words."
+        },
+        {
+          role: "user",
+          content:
+            `Dream:\n"""${dream}"""\n\n` +
+            `Aesthetic preference: ${aesthetic}\n\n` +
+            "Make 4 scenes that together feel like one dream. Include lighting, setting, mood, and key objects."
+        }
+      ],
+      text: { format: { type: "json_object" } }
+    });
+
+    const raw = (promptResponse.output_text ?? "").trim();
+    let pack: z.infer<typeof PromptPack>;
+    try {
+      pack = PromptPack.parse(JSON.parse(raw));
+    } catch {
+      return Response.json(
+        { error: "Failed to parse prompt JSON from model.", raw },
+        { status: 502 }
+      );
+    }
+
+    // 2) Generate 4 images (base64 PNG) using Images API. :contentReference[oaicite:3]{index=3}
+    const commonStyle = pack.style || "surreal dream collage, painterly, soft glow, cinematic";
+
+    // We generate each image separately so you can vary prompts while keeping consistent style.
+    const imagesB64: string[] = [];
+    for (const scenePrompt of pack.prompts) {
+      const img = await openai.images.generate({
+        model: "gpt-image-1", // GPT Image model (image generation guide mentions gpt-image-1) :contentReference[oaicite:4]{index=4}
+        prompt:
+          `${commonStyle}. ${scenePrompt}. ` +
+          "No readable text. No watermarks. High detail. Dreamlike but coherent.",
+        size: "1024x1024",
+        n: 1,
+        output_format: "png"
+      });
+
+      const b64 = img.data?.[0]?.b64_json;
+      if (!b64) {
+        return Response.json({ error: "Image generation returned no data." }, { status: 502 });
+      }
+      imagesB64.push(b64);
+    }
+
+    return Response.json({
+      style: commonStyle,
+      prompts: pack.prompts,
+      imagesB64
+    });
+  } catch (err: any) {
+    return Response.json({ error: err?.message ?? "Server error" }, { status: 500 });
+  }
+}
